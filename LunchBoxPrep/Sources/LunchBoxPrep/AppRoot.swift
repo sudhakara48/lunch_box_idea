@@ -46,11 +46,12 @@ public struct AppRoot: View {
 
         let config = AIClientConfig(baseURL: baseURL, model: model)
         let client = AIClient(keychainService: keychain, config: config)
+        let youtube = YouTubeService(keychainService: keychain)
 
         self.keychainService = keychain
         self.aiClient = client
         self.suggestionEngine = SuggestionEngine(aiClient: client)
-        self.youtubeService = YouTubeService(keychainService: keychain)
+        self.youtubeService = youtube
     }
 
     // MARK: - Body
@@ -93,37 +94,12 @@ public struct AppRoot: View {
 
     /// Scanner → Inventory → Suggestions navigation stack.
     private var scannerTab: some View {
-        NavigationStack {
-            ScannerView(
-                viewModel: ScannerViewModel(inventoryStore: inventoryStore)
-            )
-            .toolbar {
-                ToolbarItem(placement: .automatic) {
-                    NavigationLink("Inventory") {
-                        inventoryDestination
-                    }
-                }
-            }
-            .navigationTitle("Scanner")
-#if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-#endif
-        }
-    }
-
-    /// Inventory screen with a "Get Ideas" button that pushes SuggestionsView.
-    private var inventoryDestination: some View {
-        let inventoryVM = InventoryViewModel(inventoryStore: inventoryStore)
-        let suggestionsVM = SuggestionsViewModel(
-            suggestionEngine: suggestionEngine,
+        ScannerTabView(
             inventoryStore: inventoryStore,
             preferencesStore: preferencesStore,
+            favoritesStore: favoritesStore,
+            suggestionEngine: suggestionEngine,
             youtubeService: youtubeService
-        )
-        return InventoryViewWithSuggestions(
-            inventoryViewModel: inventoryVM,
-            suggestionsViewModel: suggestionsVM,
-            favoritesStore: favoritesStore
         )
     }
 
@@ -146,17 +122,99 @@ public struct AppRoot: View {
     }
 }
 
+// MARK: - ScannerTabView
+
+/// Owns `ScannerViewModel` as a `@StateObject` so it survives tab switches
+/// and body re-evaluations, keeping the camera session alive.
+private struct ScannerTabView: View {
+
+    let inventoryStore: InventoryStore
+    let preferencesStore: PreferencesStore
+    let favoritesStore: FavoritesStore
+    let suggestionEngine: SuggestionEngineProtocol
+    let youtubeService: YouTubeServiceProtocol
+
+    @StateObject private var scannerViewModel: ScannerViewModel
+
+    init(
+        inventoryStore: InventoryStore,
+        preferencesStore: PreferencesStore,
+        favoritesStore: FavoritesStore,
+        suggestionEngine: SuggestionEngineProtocol,
+        youtubeService: YouTubeServiceProtocol
+    ) {
+        self.inventoryStore = inventoryStore
+        self.preferencesStore = preferencesStore
+        self.favoritesStore = favoritesStore
+        self.suggestionEngine = suggestionEngine
+        self.youtubeService = youtubeService
+        _scannerViewModel = StateObject(wrappedValue: ScannerViewModel(inventoryStore: inventoryStore))
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScannerView(viewModel: scannerViewModel)
+                .toolbar {
+                    ToolbarItem(placement: .automatic) {
+                        NavigationLink("Inventory") {
+                            InventoryViewWithSuggestions(
+                                inventoryStore: inventoryStore,
+                                preferencesStore: preferencesStore,
+                                favoritesStore: favoritesStore,
+                                suggestionEngine: suggestionEngine,
+                                youtubeService: youtubeService
+                            )
+                        }
+                    }
+                }
+                .navigationTitle("Scanner")
+#if os(iOS)
+                .navigationBarTitleDisplayMode(.inline)
+#endif
+        }
+    }
+}
+
 // MARK: - InventoryViewWithSuggestions
 
-/// Wraps `InventoryView` and provides a `NavigationLink` destination to
-/// `SuggestionsView` when the user taps "Get Lunch Box Ideas".
+/// Wraps `InventoryView` and owns the `SuggestionsViewModel` as a `@StateObject`
+/// so it survives navigation pushes/pops and retains cached ideas + YouTube service.
 private struct InventoryViewWithSuggestions: View {
 
-    let inventoryViewModel: InventoryViewModel
-    let suggestionsViewModel: SuggestionsViewModel
+    let inventoryStore: InventoryStore
+    let preferencesStore: PreferencesStore
     let favoritesStore: FavoritesStore
+    let suggestionEngine: SuggestionEngineProtocol
+    let youtubeService: YouTubeServiceProtocol
+
+    @StateObject private var suggestionsViewModel: SuggestionsViewModel
+    @StateObject private var inventoryViewModel: InventoryViewModel
 
     @State private var showSuggestions = false
+
+    init(
+        inventoryStore: InventoryStore,
+        preferencesStore: PreferencesStore,
+        favoritesStore: FavoritesStore,
+        suggestionEngine: SuggestionEngineProtocol,
+        youtubeService: YouTubeServiceProtocol
+    ) {
+        self.inventoryStore = inventoryStore
+        self.preferencesStore = preferencesStore
+        self.favoritesStore = favoritesStore
+        self.suggestionEngine = suggestionEngine
+        self.youtubeService = youtubeService
+
+        _suggestionsViewModel = StateObject(wrappedValue: SuggestionsViewModel(
+            suggestionEngine: suggestionEngine,
+            inventoryStore: inventoryStore,
+            preferencesStore: preferencesStore,
+            youtubeService: youtubeService
+        ))
+        _inventoryViewModel = StateObject(wrappedValue: InventoryViewModel(
+            inventoryStore: inventoryStore
+        ))
+    }
 
     var body: some View {
         InventoryView(viewModel: inventoryViewModel) {

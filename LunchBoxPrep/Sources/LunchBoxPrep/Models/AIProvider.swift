@@ -54,7 +54,7 @@ public enum AIProvider: String, CaseIterable, Identifiable, Codable {
 
 // MARK: - AIModel
 
-public struct AIModel: Identifiable, Equatable, Codable {
+public struct AIModel: Identifiable, Equatable, Hashable, Codable {
     public let id: String
     public let name: String
     public let note: String

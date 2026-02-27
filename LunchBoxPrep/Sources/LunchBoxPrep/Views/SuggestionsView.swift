@@ -33,7 +33,31 @@ public struct SuggestionsView: View {
             .navigationBarTitleDisplayMode(.large)
 #endif
             .task {
+                guard viewModel.ideas.isEmpty else {
+                    // Ideas cached — try to fetch videos if not yet loaded
+                    if viewModel.ideas.allSatisfy({ $0.youtubeVideoID == nil }) {
+                        await viewModel.fetchVideos()
+                    }
+                    return
+                }
                 await viewModel.fetchSuggestions()
+            }
+            .toolbar {
+#if os(iOS)
+                if !viewModel.ideas.isEmpty {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        if viewModel.isFetchingVideos {
+                            ProgressView().scaleEffect(0.8)
+                        } else {
+                            Button {
+                                Task { await viewModel.fetchVideos() }
+                            } label: {
+                                Label("Load Videos", systemImage: "play.rectangle.fill")
+                            }
+                        }
+                    }
+                }
+#endif
             }
             .alert(
                 "Something Went Wrong",
@@ -66,11 +90,20 @@ public struct SuggestionsView: View {
     }
 
     private var ideaList: some View {
-        List(viewModel.ideas) { idea in
-            NavigationLink {
-                DetailView(idea: idea, favoritesStore: favoritesStore)
-            } label: {
-                IdeaCard(idea: idea)
+        List {
+            if let status = viewModel.youtubeStatusMessage {
+                Section {
+                    Label(status, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                }
+            }
+            ForEach(viewModel.ideas) { idea in
+                NavigationLink {
+                    DetailView(idea: idea, favoritesStore: favoritesStore)
+                } label: {
+                    IdeaCard(idea: idea)
+                }
             }
         }
         .listStyle(.inset)

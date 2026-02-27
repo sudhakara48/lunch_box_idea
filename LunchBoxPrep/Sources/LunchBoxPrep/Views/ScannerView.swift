@@ -18,10 +18,10 @@ import UIKit
 /// - Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6
 public struct ScannerView: View {
 
-    @StateObject private var viewModel: ScannerViewModel
+    @ObservedObject public var viewModel: ScannerViewModel
 
     public init(viewModel: ScannerViewModel) {
-        _viewModel = StateObject(wrappedValue: viewModel)
+        self.viewModel = viewModel
     }
 
     public var body: some View {
@@ -37,10 +37,9 @@ public struct ScannerView: View {
 
     @ViewBuilder
     private var iOSBody: some View {
-        switch viewModel.cameraPermissionStatus {
-        case .denied, .restricted:
+        if viewModel.cameraPermissionStatus == .denied || viewModel.cameraPermissionStatus == .restricted {
             CameraPermissionDeniedView()
-        default:
+        } else {
             cameraPreviewBody
         }
     }
@@ -131,7 +130,7 @@ private struct CameraPermissionDeniedView: View {
 // MARK: - Camera Preview (UIViewRepresentable)
 
 private struct CameraPreviewView: UIViewRepresentable {
-    let viewModel: ScannerViewModel
+    @ObservedObject var viewModel: ScannerViewModel
 
     func makeUIView(context: Context) -> CameraPreviewUIView {
         CameraPreviewUIView()
@@ -162,6 +161,9 @@ final class CameraPreviewUIView: UIView {
     func setSession(_ session: AVCaptureSession?) {
         guard previewLayer.session !== session else { return }
         previewLayer.session = session
+        // Force layout so the layer fills bounds immediately after session is set
+        setNeedsLayout()
+        layoutIfNeeded()
     }
 }
 

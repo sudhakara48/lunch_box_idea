@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import OSLog
 
 #if canImport(AVFoundation)
 import AVFoundation
@@ -13,14 +14,13 @@ import Vision
 import QuartzCore
 #endif
 
+private let logger = Logger(subsystem: "com.sudhakara.lunchboxprep", category: "ScannerViewModel")
+
 // MARK: - Platform-agnostic permission status
 
 #if os(iOS)
-/// Typealias so the rest of the file can reference `CameraAuthorizationStatus` uniformly.
 public typealias CameraAuthorizationStatus = AVAuthorizationStatus
 #else
-/// On macOS (CI builds) we replicate the raw values of `AVAuthorizationStatus`
-/// so the published property compiles without AVFoundation.
 @objc public enum CameraAuthorizationStatus: Int {
     case notDetermined = 0
     case restricted    = 1
@@ -31,41 +31,27 @@ public typealias CameraAuthorizationStatus = AVAuthorizationStatus
 
 // MARK: - ScannerViewModel
 
-/// ViewModel for the Scanner screen.
-///
-/// Responsibilities:
-/// - Manage `AVCaptureSession` lifecycle (`startSession` / `stopSession`)
-/// - Request camera permission and publish `cameraPermissionStatus`
-/// - Process camera frames through Vision text recognition as a proxy for food detection
-/// - Filter detections by `minimumConfidenceThreshold` before surfacing them
-/// - Bridge confirmed detections into `InventoryStore`
 @MainActor
 public final class ScannerViewModel: ObservableObject {
 
     // MARK: - Published State
 
-    /// Items detected by the scanner that are awaiting user confirmation or dismissal.
     @Published public var detectedItems: [DetectedItem] = []
-
-    /// Current camera authorisation status.
     @Published public var cameraPermissionStatus: CameraAuthorizationStatus
 
     // MARK: - Configuration
 
-    /// Detections whose confidence is below this threshold are discarded.
     public let minimumConfidenceThreshold: Float = 0.5
 
     // MARK: - Dependencies
 
     private let inventoryStore: InventoryStore
 
-    // MARK: - Private — AVCapture / Vision (iOS only)
-
 #if os(iOS)
     @Published public private(set) var captureSession: AVCaptureSession?
-    private let sessionQueue = DispatchQueue(label: "com.lunchboxprep.scanner.session")
+    private let sessionQueue = DispatchQueue(label: "com.lunchboxprep.scanner.session", qos: .userInitiated)
     private var videoOutput: AVCaptureVideoDataOutput?
-    private var textRequest: VNRequest?
+    private var textRequest: VNRecognizeTextRequest?
     private var lastProcessedTime: Double = 0
     private var sampleBufferDelegate: SampleBufferDelegate?
 #endif
@@ -83,20 +69,19 @@ public final class ScannerViewModel: ObservableObject {
 
     // MARK: - Session Lifecycle
 
-    /// Requests camera permission (if needed) then starts the capture session.
     public func startSession() {
 #if os(iOS)
         let status = AVCaptureDevice.authorizationStatus(for: .video)
         switch status {
         case .authorized:
             cameraPermissionStatus = .authorized
-            startCaptureSession()
+            setupAndStartSession()
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.cameraPermissionStatus = granted ? .authorized : .denied
-                    if granted { self.startCaptureSession() }
+                    if granted { self.setupAndStartSession() }
                 }
             }
         case .denied, .restricted:
@@ -105,37 +90,31 @@ public final class ScannerViewModel: ObservableObject {
             cameraPermissionStatus = status
         }
 #else
-        // macOS stub — no camera access in CI builds
         cameraPermissionStatus = .authorized
 #endif
     }
 
-    /// Stops the capture session and releases resources.
     public func stopSession() {
 #if os(iOS)
         sessionQueue.async { [weak self] in
             self?.captureSession?.stopRunning()
+            logger.info("Capture session stopped")
         }
 #endif
     }
 
     // MARK: - User Actions
 
-    /// Confirms a detected item: creates an `InventoryItem` in the store and removes it from `detectedItems`.
     public func confirm(_ item: DetectedItem) {
         let inventoryItem = InventoryItem(id: UUID(), name: item.name, quantity: "")
         inventoryStore.add(inventoryItem)
         detectedItems.removeAll { $0.id == item.id }
     }
 
-    /// Dismisses a detected item without adding it to the inventory.
     public func dismiss(_ item: DetectedItem) {
         detectedItems.removeAll { $0.id == item.id }
     }
 
-    /// Adds a manually typed food item directly to the inventory.
-    ///
-    /// - Parameter name: The item name. Whitespace-only or empty strings are ignored.
     public func addManualItem(name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -143,10 +122,6 @@ public final class ScannerViewModel: ObservableObject {
         inventoryStore.add(item)
     }
 
-    // MARK: - Internal: add a detection (used by frame processing and tests)
-
-    /// Adds a `DetectedItem` to `detectedItems` only if its confidence meets the threshold
-    /// and no item with the same name is already pending.
     func addDetection(_ item: DetectedItem) {
         guard item.confidence >= minimumConfidenceThreshold else { return }
         guard !detectedItems.contains(where: { $0.name.lowercased() == item.name.lowercased() }) else { return }
@@ -154,37 +129,57 @@ public final class ScannerViewModel: ObservableObject {
     }
 }
 
-// MARK: - iOS AVCapture + Vision integration
+// MARK: - iOS AVCapture + Vision
 
 #if os(iOS)
 extension ScannerViewModel {
 
-    private func startCaptureSession() {
+    /// Builds the AVCaptureSession on the session queue, then publishes it on
+    /// the main actor so the preview layer can connect before startRunning().
+    private func setupAndStartSession() {
+        // If already running, skip
+        if captureSession?.isRunning == true { return }
+
         sessionQueue.async { [weak self] in
             guard let self else { return }
+
             let session = AVCaptureSession()
+            session.beginConfiguration()
             session.sessionPreset = .high
 
+            // Input
             guard
                 let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
                 let input = try? AVCaptureDeviceInput(device: device),
                 session.canAddInput(input)
-            else { return }
-
+            else {
+                logger.error("Failed to create camera input")
+                session.commitConfiguration()
+                return
+            }
             session.addInput(input)
 
+            // Output
             let output = AVCaptureVideoDataOutput()
             output.videoSettings = [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
             ]
             output.alwaysDiscardsLateVideoFrames = true
 
-            guard session.canAddOutput(output) else { return }
-            session.addOutput(output)
-
-            let request = VNClassifyImageRequest { [weak self] request, _ in
-                self?.handleClassificationResults(request.results)
+            guard session.canAddOutput(output) else {
+                logger.error("Failed to add video output")
+                session.commitConfiguration()
+                return
             }
+            session.addOutput(output)
+            session.commitConfiguration()
+
+            // Vision request
+            let request = VNRecognizeTextRequest { [weak self] req, _ in
+                self?.handleTextRecognitionResults(req.results)
+            }
+            request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = true
 
             let delegate = SampleBufferDelegate { [weak self] sampleBuffer in
                 self?.processSampleBuffer(sampleBuffer)
@@ -192,16 +187,21 @@ extension ScannerViewModel {
             output.setSampleBufferDelegate(delegate, queue: self.sessionQueue)
 
             // Publish session on main actor BEFORE startRunning so the
-            // preview layer is connected when frames start arriving
+            // preview layer attaches in time
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.sampleBufferDelegate = delegate
                 self.videoOutput = output
                 self.textRequest = request
                 self.captureSession = session
-            }
+                logger.info("Capture session published to main actor")
 
-            session.startRunning()
+                // Start running after a short delay to let the preview layer attach
+                self.sessionQueue.asyncAfter(deadline: .now() + 0.1) {
+                    session.startRunning()
+                    logger.info("Capture session startRunning called, isRunning=\(session.isRunning)")
+                }
+            }
         }
     }
 
@@ -209,7 +209,6 @@ extension ScannerViewModel {
         guard let request = textRequest else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-        // Throttle: only process one frame per second
         let now = CACurrentMediaTime()
         guard now - lastProcessedTime >= 1.0 else { return }
         lastProcessedTime = now
@@ -218,38 +217,22 @@ extension ScannerViewModel {
         try? handler.perform([request])
     }
 
-    private func handleClassificationResults(_ results: [VNObservation]?) {
-        guard let observations = results as? [VNClassificationObservation] else { return }
-
-        // Food-related identifier keywords from the Vision taxonomy
-        let foodKeywords = ["food", "fruit", "vegetable", "meat", "bread", "cheese",
-                            "egg", "fish", "seafood", "pasta", "rice", "bean", "nut",
-                            "dairy", "beverage", "snack", "dessert", "herb", "spice",
-                            "grain", "legume", "poultry", "pork", "beef", "lamb"]
-
-        for observation in observations {
-            guard observation.confidence >= minimumConfidenceThreshold else { continue }
-            let identifier = observation.identifier.lowercased()
-            guard foodKeywords.contains(where: { identifier.contains($0) }) else { continue }
-
-            // Clean up the Vision label: "Granny Smith apple" → "Granny Smith Apple"
-            let name = observation.identifier
-                .replacingOccurrences(of: "_", with: " ")
-                .split(separator: ",")
-                .first
-                .map(String.init)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .capitalized ?? observation.identifier
-
-            let detected = DetectedItem(id: UUID(), name: name, confidence: observation.confidence)
-            Task { @MainActor [weak self] in
-                self?.addDetection(detected)
-            }
-        }
-    }
-
     private func handleTextRecognitionResults(_ results: [VNObservation]?) {
         guard let observations = results as? [VNRecognizedTextObservation] else { return }
+
+        let foodKeywords: Set<String> = [
+            "apple", "banana", "orange", "grape", "strawberry", "blueberry", "mango",
+            "pineapple", "watermelon", "lemon", "lime", "peach", "pear", "cherry",
+            "carrot", "broccoli", "spinach", "lettuce", "tomato", "cucumber", "pepper",
+            "onion", "garlic", "potato", "corn", "pea", "bean", "celery", "zucchini",
+            "chicken", "beef", "pork", "turkey", "salmon", "tuna", "shrimp", "egg",
+            "cheese", "milk", "yogurt", "butter", "cream", "tofu",
+            "rice", "pasta", "bread", "noodle", "tortilla", "wrap",
+            "almond", "walnut", "cashew", "peanut", "sunflower",
+            "avocado", "hummus", "salsa", "mayo", "mustard", "ketchup",
+            "sandwich", "salad", "soup", "stew", "curry", "stir", "fry",
+            "organic", "fresh", "natural", "whole", "grain", "wheat", "oat"
+        ]
 
         for observation in observations {
             guard
@@ -258,9 +241,12 @@ extension ScannerViewModel {
             else { continue }
 
             let text = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { continue }
+            guard text.count >= 3 else { continue }
 
-            let detected = DetectedItem(id: UUID(), name: text, confidence: candidate.confidence)
+            let lower = text.lowercased()
+            guard foodKeywords.contains(where: { lower.contains($0) }) else { continue }
+
+            let detected = DetectedItem(id: UUID(), name: text.capitalized, confidence: candidate.confidence)
             Task { @MainActor [weak self] in
                 self?.addDetection(detected)
             }
@@ -268,7 +254,7 @@ extension ScannerViewModel {
     }
 }
 
-// MARK: - Sample buffer delegate helper
+// MARK: - Sample buffer delegate
 
 private final class SampleBufferDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     private let handler: (CMSampleBuffer) -> Void
